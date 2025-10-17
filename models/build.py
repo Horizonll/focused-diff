@@ -41,7 +41,7 @@ def build_model(config):
             ape=config.MODEL.SWIN.APE,
             patch_norm=config.MODEL.SWIN.PATCH_NORM,
             use_checkpoint=config.TRAIN.USE_CHECKPOINT,
-            agent_num=config.MODEL.AGENT.NUM.split("-"),
+            agent_num=config.MODEL.AGENT.NUM,
             attn_type=config.MODEL.AGENT.ATTN_TYPE,
         )
 
@@ -53,7 +53,7 @@ def build_model(config):
         model = eval(
             model_type + "(img_size=config.DATA.IMG_SIZE,"
             "drop_path_rate=config.MODEL.DROP_PATH_RATE,"
-            "agent_num=config.MODEL.AGENT.NUM.split('-'))"
+            "agent_num=config.MODEL.AGENT.NUM)"
         )
 
     elif model_type in [
@@ -66,7 +66,7 @@ def build_model(config):
         model = eval(
             model_type + "(img_size=config.DATA.IMG_SIZE,"
             "drop_path_rate=config.MODEL.DROP_PATH_RATE,"
-            "agent_num=config.MODEL.AGENT.NUM.split('-'),"
+            "agent_num=config.MODEL.AGENT.NUM,"
             "attn_type=config.MODEL.AGENT.ATTN_TYPE,"
             "agent_sr_ratios=str(config.MODEL.AGENT.PVT_LA_SR_RATIOS))"
         )
@@ -84,7 +84,7 @@ def build_model(config):
             "num_classes=config.MODEL.NUM_CLASSES,"
             "drop_rate=config.MODEL.DROP_RATE,"
             "drop_path_rate=config.MODEL.DROP_PATH_RATE,"
-            "agent_num=config.MODEL.AGENT.NUM.split('-'),"
+            "agent_num=config.MODEL.AGENT.NUM,"
             "attn_type=config.MODEL.AGENT.ATTN_TYPE,"
             "la_split_size=config.MODEL.AGENT.CSWIN_LA_SPLIT_SIZE)"
         )
