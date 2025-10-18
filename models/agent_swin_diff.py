@@ -242,8 +242,8 @@ class WindowAttention(nn.Module):
         return flops
 
 
-def focused_function(x, p=3):
-    norm = x.norm(dim=-1, keepdim=True)
+def focused_function(x, p=3, eps=1e-6):
+    norm = x.norm(dim=-1, keepdim=True).clamp_min(eps)
     x = x**p
     x = (x / x.norm(dim=-1, keepdim=True)) * norm
     return x
@@ -286,7 +286,7 @@ class AgentAttention(nn.Module):
         self.agent_token_embedding_pos = nn.Parameter(torch.randn(1, agent_num, dim))
         self.agent_token_embedding_neg = nn.Parameter(torch.randn(1, agent_num, dim))
 
-        self.lambda_init = lambda_init_fn(block_depth)
+        self.lambda_agent_init = lambda_init_fn(block_depth)
         self.lambda_agent_q1 = nn.Parameter(
             torch.zeros(head_dim, dtype=torch.float32).normal_(mean=0, std=0.1)
         )
@@ -300,7 +300,7 @@ class AgentAttention(nn.Module):
             torch.zeros(head_dim, dtype=torch.float32).normal_(mean=0, std=0.1)
         )
         self.subln1 = RMSNorm(head_dim, eps=1e-5, elementwise_affine=True)
-
+        self.lambda_attn_init = lambda_init_fn(block_depth)
         self.lambda_attn_q1 = nn.Parameter(
             torch.zeros(head_dim, dtype=torch.float32).normal_(mean=0, std=0.1)
         )
@@ -342,12 +342,12 @@ class AgentAttention(nn.Module):
         ).permute(0, 2, 1, 3)
 
         lambda_agent_1 = torch.exp(
-            torch.sum(self.lambda_agent_q1 * self.lambda_agent_k1, dim=-1)
-        )
+            torch.sum(self.lambda_agent_q1 * self.lambda_agent_k1, dim=-1).float()
+        ).type_as(q)
         lambda_agent_2 = torch.exp(
-            torch.sum(self.lambda_agent_q2 * self.lambda_agent_k2, dim=-1)
-        )
-        lambda_agent_full = lambda_agent_1 - lambda_agent_2 + self.lambda_init
+            torch.sum(self.lambda_agent_q2 * self.lambda_agent_k2, dim=-1).float()
+        ).type_as(q)
+        lambda_agent_full = lambda_agent_1 - lambda_agent_2 + self.lambda_agent_init
 
         agent_attn1 = self.softmax(
             (agent_tokens_pos * self.scale) @ k.transpose(-2, -1)
@@ -357,28 +357,28 @@ class AgentAttention(nn.Module):
 
         agent_tokens_neg = F.relu(agent_tokens_neg)
         k = F.relu(k)
-        agent_tokens_neg = focused_function(agent_tokens_neg)
-        k = focused_function(k)
+        # agent_tokens_neg = focused_function(agent_tokens_neg)
+        # k = focused_function(k)
         z = 1 / (
             agent_tokens_neg @ k.mean(dim=-2, keepdim=True).transpose(-2, -1) + 1e-6
         )
-        kv = k.transpose(-2, -1) @ v / N
+        kv = (k.transpose(-2, -1) * (N**-0.5)) @ (v * (N**-0.5))
         agent_v2 = agent_tokens_neg @ kv * z
 
         agent_v = agent_v1 - lambda_agent_full * agent_v2
         agent_v = self.subln1(agent_v)
-        agent_v = agent_v * (1 - self.lambda_init)
+        agent_v = agent_v * (1 - self.lambda_agent_init)
 
         agent_tokens_pos, agent_tokens_neg = agent_tokens_pos.chunk(2, dim=-1)
         q_pos, q_neg = q.chunk(2, dim=-1)
 
         lambda_attn_1 = torch.exp(
-            torch.sum(self.lambda_attn_q1 * self.lambda_attn_k1, dim=-1)
-        )
+            torch.sum(self.lambda_attn_q1 * self.lambda_attn_k1, dim=-1).float()
+        ).type_as(q)
         lambda_attn_2 = torch.exp(
-            torch.sum(self.lambda_attn_q2 * self.lambda_attn_k2, dim=-1)
-        )
-        lambda_attn_full = lambda_attn_1 - lambda_attn_2 + self.lambda_init
+            torch.sum(self.lambda_attn_q2 * self.lambda_attn_k2, dim=-1).float()
+        ).type_as(q)
+        lambda_attn_full = lambda_attn_1 - lambda_attn_2 + self.lambda_attn_init
 
         q_attn1 = self.softmax(
             (q_pos * self.scale) @ agent_tokens_pos.transpose(-2, -1)
@@ -388,8 +388,8 @@ class AgentAttention(nn.Module):
 
         agent_tokens_pos = F.relu(agent_tokens_pos)
         q_neg = F.relu(q_neg)
-        agent_tokens_pos = focused_function(agent_tokens_pos)
-        q_neg = focused_function(q_neg)
+        # agent_tokens_pos = focused_function(agent_tokens_pos)
+        # q_neg = focused_function(q_neg)
         z = 1 / (
             q_neg @ agent_tokens_pos.mean(dim=-2, keepdim=True).transpose(-2, -1) + 1e-6
         )
@@ -399,7 +399,7 @@ class AgentAttention(nn.Module):
         x = x1 - lambda_attn_full * x2
 
         x = self.subln2(x)
-        x = x * (1 - self.lambda_init)
+        x = x * (1 - self.lambda_attn_init)
 
         x = x.transpose(1, 2).reshape(B, N, C)
         v = v.transpose(1, 2).reshape(B, H, W, C).permute(0, 3, 1, 2)
