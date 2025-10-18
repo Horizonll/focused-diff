@@ -359,8 +359,8 @@ def train_one_epoch(
                 f"grad_norm {norm_meter.val:.4f} ({norm_meter.avg:.4f})\t"
                 f"mem {memory_used:.0f}MB"
             )
-            if dist.get_rank() == 0:
-                wandb.log({"train-loss": loss_meter.avg})
+    if dist.get_rank() == 0:
+        wandb.log({"train-loss": loss_meter.avg})
     epoch_time = time.time() - start
     logger.info(
         f"EPOCH {epoch + 1} training takes {datetime.timedelta(seconds=int(epoch_time))}"
