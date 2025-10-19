@@ -220,7 +220,7 @@ def main():
     for epoch in range(config.TRAIN.START_EPOCH, total_epochs):
         data_loader_train.sampler.set_epoch(epoch)
 
-        train_one_epoch(
+        train_loss = train_one_epoch(
             config,
             model,
             criterion,
@@ -232,13 +232,13 @@ def main():
             logger,
             total_epochs,
         )
-        acc1, acc5, loss = validate(config, data_loader_val, model, logger)
+        acc1, acc5, val_loss = validate(config, data_loader_val, model, logger)
         logger.info(
             f"Accuracy of the network on the {len(dataset_val)} test images: {acc1:.1f}%"
         )
 
         if dist.get_rank() == 0:
-            wandb.log({"acc": acc1, "val-loss": loss})
+            wandb.log({"acc": acc1, "val-loss": val_loss, "train-loss": train_loss})
 
         if dist.get_rank() == 0 and (
             (epoch + 1) % config.SAVE_FREQ == 0 or (epoch + 1) == (total_epochs)
@@ -359,12 +359,11 @@ def train_one_epoch(
                 f"grad_norm {norm_meter.val:.4f} ({norm_meter.avg:.4f})\t"
                 f"mem {memory_used:.0f}MB"
             )
-    if dist.get_rank() == 0:
-        wandb.log({"train-loss": loss_meter.avg})
     epoch_time = time.time() - start
     logger.info(
         f"EPOCH {epoch + 1} training takes {datetime.timedelta(seconds=int(epoch_time))}"
     )
+    return loss_meter.avg
 
 
 @torch.no_grad()

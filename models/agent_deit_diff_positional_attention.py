@@ -23,12 +23,6 @@ for some einops/einsum fun
 Hacked together by / Copyright 2021 Ross Wightman
 """
 
-# -----------------------------------------------------------------------
-# Agent Attention: On the Integration of Softmax and Linear Attention
-# Modified by Dongchen Han
-# -----------------------------------------------------------------------
-
-
 import logging
 import math
 from collections import OrderedDict
@@ -318,6 +312,8 @@ class AgentAttention(nn.Module):
         self.agent_token_embedding_pos = nn.Parameter(torch.randn(1, agent_num, dim))
         self.agent_token_embedding_neg = nn.Parameter(torch.randn(1, agent_num, dim))
 
+        self.rot_linear = nn.Linear(dim, 1)
+
         self.lambda_agent_init = lambda_init_fn(block_depth)
         self.lambda_agent_q1 = nn.Parameter(
             torch.zeros(head_dim, dtype=torch.float32).normal_(mean=0, std=0.1)
@@ -360,8 +356,31 @@ class AgentAttention(nn.Module):
             .reshape(B, C, -1)
             .permute(0, 2, 1)
         )
-        agent_tokens_pos = agent_tokens + self.agent_token_embedding_pos
-        agent_tokens_neg = agent_tokens + self.agent_token_embedding_neg
+        # Compute rotation angle from queries
+        q_pooled = q[:, 1:, :].mean(dim=1)  # B, C
+        theta = self.rot_linear(q_pooled).squeeze(-1)  # B
+        cos_theta = torch.cos(theta)
+        sin_theta = torch.sin(theta)
+        R = torch.stack([cos_theta, -sin_theta, sin_theta, cos_theta], dim=1).view(
+            B, 2, 2
+        )  # B, 2, 2
+
+        # Rotate embeddings
+        agent_token_embedding_pos_exp = self.agent_token_embedding_pos.expand(
+            B, -1, -1
+        )  # B, agent_num, dim
+        agent_token_embedding_neg_exp = self.agent_token_embedding_neg.expand(B, -1, -1)
+        pos_rot = agent_token_embedding_pos_exp.clone()
+        neg_rot = agent_token_embedding_neg_exp.clone()
+        pos_rot[..., :2] = torch.einsum(
+            "bij,bjk->bik", agent_token_embedding_pos_exp[..., :2], R
+        )
+        neg_rot[..., :2] = torch.einsum(
+            "bij,bjk->bik", agent_token_embedding_neg_exp[..., :2], R
+        )
+
+        agent_tokens_pos = agent_tokens + pos_rot
+        agent_tokens_neg = neg_rot  # Positional-only for negative stream
 
         q = q.reshape(B, N, num_heads, head_dim).permute(0, 2, 1, 3)
         k = k.reshape(B, N, num_heads, head_dim).permute(0, 2, 1, 3)
@@ -381,17 +400,28 @@ class AgentAttention(nn.Module):
         ).type_as(q)
         lambda_agent_full = lambda_agent_1 - lambda_agent_2 + self.lambda_agent_init
 
-        agent_tokens_all = torch.cat((agent_tokens_pos, agent_tokens_neg), dim=2)
-        agent_attn = self.softmax((agent_tokens_all * self.scale) @ k.transpose(-2, -1))
-
-        agent_v_all = agent_attn @ v
-        agent_v = (
-            agent_v_all[:, :, : self.agent_num]
-            - lambda_agent_full * agent_v_all[:, :, self.agent_num :]
+        agent_attn1 = self.softmax(
+            (agent_tokens_pos * self.scale) @ k.transpose(-2, -1)
         )
+        agent_attn1 = self.attn_drop(agent_attn1)
+        agent_v1 = agent_attn1 @ v
 
+        agent_tokens_neg = F.relu(agent_tokens_neg)
+        k = F.relu(k)
+        # agent_tokens_neg = focused_function(agent_tokens_neg)
+        # k = focused_function(k)
+        z = 1 / (
+            agent_tokens_neg @ k.mean(dim=-2, keepdim=True).transpose(-2, -1) + 1e-6
+        )
+        kv = (k.transpose(-2, -1) * (N**-0.5)) @ (v * (N**-0.5))
+        agent_v2 = agent_tokens_neg @ kv * z
+
+        agent_v = agent_v1 - lambda_agent_full * agent_v2
         agent_v = self.subln1(agent_v)
         agent_v = agent_v * (1 - self.lambda_agent_init)
+
+        agent_tokens_pos, agent_tokens_neg = agent_tokens_pos.chunk(2, dim=-1)
+        q_pos, q_neg = q.chunk(2, dim=-1)
 
         lambda_attn_1 = torch.exp(
             torch.sum(self.lambda_attn_q1 * self.lambda_attn_k1, dim=-1).float()
@@ -401,10 +431,24 @@ class AgentAttention(nn.Module):
         ).type_as(q)
         lambda_attn_full = lambda_attn_1 - lambda_attn_2 + self.lambda_attn_init
 
-        q_attn = self.softmax((q * self.scale) @ agent_tokens_all.transpose(-2, -1))
-        q_attn = q_attn.view(B, num_heads, N, 2, self.agent_num).permute(0, 1, 3, 2, 4)
-        q_attn = q_attn[:, :, 0] - lambda_attn_full * q_attn[:, :, 1]
-        x = q_attn @ agent_v
+        q_attn1 = self.softmax(
+            (q_pos * self.scale) @ agent_tokens_pos.transpose(-2, -1)
+        )
+        q_attn1 = self.attn_drop(q_attn1)
+        x1 = q_attn1 @ agent_v
+
+        agent_tokens_pos = F.relu(agent_tokens_pos)
+        q_neg = F.relu(q_neg)
+        # agent_tokens_pos = focused_function(agent_tokens_pos)
+        # q_neg = focused_function(q_neg)
+        z = 1 / (
+            q_neg @ agent_tokens_pos.mean(dim=-2, keepdim=True).transpose(-2, -1) + 1e-6
+        )
+        kv = (agent_tokens_pos.transpose(-2, -1) * (N**-0.5)) @ (agent_v * (N**-0.5))
+        x2 = q_neg @ kv * z
+
+        x = x1 - lambda_attn_full * x2
+
         x = self.subln2(x)
         x = x * (1 - self.lambda_attn_init)
 

@@ -47,7 +47,6 @@ from timm.models.helpers import adapt_input_conv, build_model_with_cfg, named_ap
 from timm.models.layers import DropPath, Mlp, PatchEmbed, lecun_normal_, trunc_normal_
 from timm.models.registry import register_model
 
-from .deit import Block
 
 _logger = logging.getLogger(__name__)
 
@@ -276,13 +275,6 @@ class RMSNorm(nn.Module):
         return f"dim={self.dim}, eps={self.eps}, elementwise_affine={self.elementwise_affine}"
 
 
-def focused_function(x, p=3):
-    norm = x.norm(dim=-1, keepdim=True)
-    x = x**p
-    x = (x / x.norm(dim=-1, keepdim=True)) * norm
-    return x
-
-
 class AgentAttention(nn.Module):
     def __init__(
         self,
@@ -315,37 +307,50 @@ class AgentAttention(nn.Module):
         pool_size = int(agent_num**0.5)
         self.pool = nn.AdaptiveAvgPool2d(output_size=(pool_size, pool_size))
 
-        self.agent_token_embedding_pos = nn.Parameter(torch.randn(1, agent_num, dim))
-        self.agent_token_embedding_neg = nn.Parameter(torch.randn(1, agent_num, dim))
+        self.t_embedding_pos = nn.Parameter(torch.randn(1, agent_num, dim))
+        self.t_embedding_neg = nn.Parameter(torch.randn(1, agent_num, dim))
 
-        self.lambda_agent_init = lambda_init_fn(block_depth)
-        self.lambda_agent_q1 = nn.Parameter(
+        self.lambda_init = lambda_init_fn(block_depth)
+
+        self.lambda_q11 = nn.Parameter(
             torch.zeros(head_dim, dtype=torch.float32).normal_(mean=0, std=0.1)
         )
-        self.lambda_agent_k1 = nn.Parameter(
+        self.lambda_k11 = nn.Parameter(
             torch.zeros(head_dim, dtype=torch.float32).normal_(mean=0, std=0.1)
         )
-        self.lambda_agent_q2 = nn.Parameter(
+        self.lambda_q12 = nn.Parameter(
             torch.zeros(head_dim, dtype=torch.float32).normal_(mean=0, std=0.1)
         )
-        self.lambda_agent_k2 = nn.Parameter(
+        self.lambda_k12 = nn.Parameter(
             torch.zeros(head_dim, dtype=torch.float32).normal_(mean=0, std=0.1)
         )
-        self.subln1 = RMSNorm(head_dim, eps=1e-5, elementwise_affine=True)
-        self.lambda_attn_init = lambda_init_fn(block_depth)
-        self.lambda_attn_q1 = nn.Parameter(
+        self.lambda_q21 = nn.Parameter(
             torch.zeros(head_dim, dtype=torch.float32).normal_(mean=0, std=0.1)
         )
-        self.lambda_attn_k1 = nn.Parameter(
+        self.lambda_k21 = nn.Parameter(
             torch.zeros(head_dim, dtype=torch.float32).normal_(mean=0, std=0.1)
         )
-        self.lambda_attn_q2 = nn.Parameter(
+        self.lambda_q22 = nn.Parameter(
             torch.zeros(head_dim, dtype=torch.float32).normal_(mean=0, std=0.1)
         )
-        self.lambda_attn_k2 = nn.Parameter(
+        self.lambda_k22 = nn.Parameter(
             torch.zeros(head_dim, dtype=torch.float32).normal_(mean=0, std=0.1)
         )
-        self.subln2 = RMSNorm(head_dim, eps=1e-5, elementwise_affine=True)
+        self.lambda_q31 = nn.Parameter(
+            torch.zeros(head_dim, dtype=torch.float32).normal_(mean=0, std=0.1)
+        )
+        self.lambda_k31 = nn.Parameter(
+            torch.zeros(head_dim, dtype=torch.float32).normal_(mean=0, std=0.1)
+        )
+        self.lambda_q32 = nn.Parameter(
+            torch.zeros(head_dim, dtype=torch.float32).normal_(mean=0, std=0.1)
+        )
+        self.lambda_k32 = nn.Parameter(
+            torch.zeros(head_dim, dtype=torch.float32).normal_(mean=0, std=0.1)
+        )
+
+        self.subln1 = RMSNorm(head_dim, eps=1e-5)
+        self.subln2 = RMSNorm(head_dim, eps=1e-5)
 
     def forward(self, x):
         B, N, C = x.shape
@@ -355,58 +360,75 @@ class AgentAttention(nn.Module):
         head_dim = C // num_heads
         qkv = self.qkv(x).reshape(B, N, 3, C).permute(2, 0, 1, 3)
         q, k, v = qkv.unbind(0)
-        agent_tokens = (
+        t = (
             self.pool(q[:, 1:, :].reshape(B, H, W, C).permute(0, 3, 1, 2))
             .reshape(B, C, -1)
             .permute(0, 2, 1)
         )
-        agent_tokens_pos = agent_tokens + self.agent_token_embedding_pos
-        agent_tokens_neg = agent_tokens + self.agent_token_embedding_neg
+        t_pos = t + self.t_embedding_pos
+        t_neg = t + self.t_embedding_neg
 
         q = q.reshape(B, N, num_heads, head_dim).permute(0, 2, 1, 3)
         k = k.reshape(B, N, num_heads, head_dim).permute(0, 2, 1, 3)
         v = v.reshape(B, N, num_heads, head_dim).permute(0, 2, 1, 3)
-        agent_tokens_pos = agent_tokens_pos.reshape(
-            B, self.agent_num, num_heads, head_dim
-        ).permute(0, 2, 1, 3)
-        agent_tokens_neg = agent_tokens_neg.reshape(
-            B, self.agent_num, num_heads, head_dim
-        ).permute(0, 2, 1, 3)
-
-        lambda_agent_1 = torch.exp(
-            torch.sum(self.lambda_agent_q1 * self.lambda_agent_k1, dim=-1).float()
-        ).type_as(q)
-        lambda_agent_2 = torch.exp(
-            torch.sum(self.lambda_agent_q2 * self.lambda_agent_k2, dim=-1).float()
-        ).type_as(q)
-        lambda_agent_full = lambda_agent_1 - lambda_agent_2 + self.lambda_agent_init
-
-        agent_tokens_all = torch.cat((agent_tokens_pos, agent_tokens_neg), dim=2)
-        agent_attn = self.softmax((agent_tokens_all * self.scale) @ k.transpose(-2, -1))
-
-        agent_v_all = agent_attn @ v
-        agent_v = (
-            agent_v_all[:, :, : self.agent_num]
-            - lambda_agent_full * agent_v_all[:, :, self.agent_num :]
+        t_pos = t_pos.reshape(B, self.agent_num, num_heads, head_dim).permute(
+            0, 2, 1, 3
+        )
+        t_neg = t_neg.reshape(B, self.agent_num, num_heads, head_dim).permute(
+            0, 2, 1, 3
         )
 
-        agent_v = self.subln1(agent_v)
-        agent_v = agent_v * (1 - self.lambda_agent_init)
-
-        lambda_attn_1 = torch.exp(
-            torch.sum(self.lambda_attn_q1 * self.lambda_attn_k1, dim=-1).float()
+        lambda_1 = torch.exp(
+            torch.sum(self.lambda_q11 * self.lambda_k11, dim=-1).float()
         ).type_as(q)
-        lambda_attn_2 = torch.exp(
-            torch.sum(self.lambda_attn_q2 * self.lambda_attn_k2, dim=-1).float()
+        lambda_2 = torch.exp(
+            torch.sum(self.lambda_q12 * self.lambda_k12, dim=-1).float()
         ).type_as(q)
-        lambda_attn_full = lambda_attn_1 - lambda_attn_2 + self.lambda_attn_init
+        lambda_full = lambda_1 - lambda_2 + self.lambda_init
 
-        q_attn = self.softmax((q * self.scale) @ agent_tokens_all.transpose(-2, -1))
-        q_attn = q_attn.view(B, num_heads, N, 2, self.agent_num).permute(0, 1, 3, 2, 4)
-        q_attn = q_attn[:, :, 0] - lambda_attn_full * q_attn[:, :, 1]
-        x = q_attn @ agent_v
+        attn = self.softmax((t_pos * self.scale) @ k.transpose(-2, -1))
+        attn = self.attn_drop(attn)
+        v_hat_pos = attn @ v
+        attn = self.softmax((t_neg * self.scale) @ k.transpose(-2, -1))
+        attn = self.attn_drop(attn)
+        v_hat_neg = attn @ v
+        v_hat = v_hat_pos - lambda_full * v_hat_neg
+        v_hat = self.subln1(v_hat)
+        v_hat = v_hat * (1 - self.lambda_init)
+
+        v_hat_pos1, v_hat_pos2 = v_hat.chunk(2, dim=-1)
+        v_hat_neg1, v_hat_neg2 = v_hat.chunk(2, dim=-1)
+        q1, q2 = q.chunk(2, dim=-1)
+
+        lambda_1 = torch.exp(
+            torch.sum(self.lambda_q21 * self.lambda_k21, dim=-1).float()
+        ).type_as(q)
+        lambda_2 = torch.exp(
+            torch.sum(self.lambda_q22 * self.lambda_k22, dim=-1).float()
+        ).type_as(q)
+        lambda_full = lambda_1 - lambda_2 + self.lambda_init
+
+        attn_pos1 = self.softmax(q1 * (self.scale) @ v_hat_pos1.transpose(-2, -1))
+        attn_pos2 = self.softmax(q2 * (self.scale) @ v_hat_pos2.transpose(-2, -1))
+        attn_pos = attn_pos1 - lambda_full * attn_pos2
+
+        attn_neg1 = self.softmax(q1 * (self.scale) @ v_hat_neg2.transpose(-2, -1))
+        attn_neg2 = self.softmax(q2 * (self.scale) @ v_hat_neg1.transpose(-2, -1))
+        attn_neg = attn_neg1 - lambda_full * attn_neg2
+
+        lambda_1 = torch.exp(
+            torch.sum(self.lambda_q31 * self.lambda_k31, dim=-1).float()
+        ).type_as(q)
+        lambda_2 = torch.exp(
+            torch.sum(self.lambda_q32 * self.lambda_k32, dim=-1).float()
+        ).type_as(q)
+        lambda_full = lambda_1 - lambda_2 + self.lambda_init
+
+        attn = attn_pos - lambda_full * attn_neg
+        attn = self.attn_drop(attn)
+        x = attn @ v_hat
         x = self.subln2(x)
-        x = x * (1 - self.lambda_attn_init)
+        x = x * (1 - self.lambda_init)
 
         x = x.transpose(1, 2).reshape(B, N, C)
         v = v[:, :, 1:, :].transpose(1, 2).reshape(B, H, W, C).permute(0, 3, 1, 2)

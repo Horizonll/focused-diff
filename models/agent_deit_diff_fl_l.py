@@ -381,17 +381,28 @@ class AgentAttention(nn.Module):
         ).type_as(q)
         lambda_agent_full = lambda_agent_1 - lambda_agent_2 + self.lambda_agent_init
 
-        agent_tokens_all = torch.cat((agent_tokens_pos, agent_tokens_neg), dim=2)
-        agent_attn = self.softmax((agent_tokens_all * self.scale) @ k.transpose(-2, -1))
-
-        agent_v_all = agent_attn @ v
-        agent_v = (
-            agent_v_all[:, :, : self.agent_num]
-            - lambda_agent_full * agent_v_all[:, :, self.agent_num :]
+        agent_attn1 = self.softmax(
+            (agent_tokens_pos * self.scale) @ k.transpose(-2, -1)
         )
+        agent_attn1 = self.attn_drop(agent_attn1)
+        agent_v1 = agent_attn1 @ v
 
+        agent_tokens_neg = F.relu(agent_tokens_neg)
+        k = F.relu(k)
+        # agent_tokens_neg = focused_function(agent_tokens_neg)
+        # k = focused_function(k)
+        z = 1 / (
+            agent_tokens_neg @ k.mean(dim=-2, keepdim=True).transpose(-2, -1) + 1e-6
+        )
+        kv = (k.transpose(-2, -1) * (N**-0.5)) @ (v * (N**-0.5))
+        agent_v2 = agent_tokens_neg @ kv * z
+
+        agent_v = agent_v1 - lambda_agent_full * agent_v2
         agent_v = self.subln1(agent_v)
         agent_v = agent_v * (1 - self.lambda_agent_init)
+
+        agent_tokens_pos, agent_tokens_neg = agent_tokens_pos.chunk(2, dim=-1)
+        q_pos, q_neg = q.chunk(2, dim=-1)
 
         lambda_attn_1 = torch.exp(
             torch.sum(self.lambda_attn_q1 * self.lambda_attn_k1, dim=-1).float()
@@ -401,10 +412,24 @@ class AgentAttention(nn.Module):
         ).type_as(q)
         lambda_attn_full = lambda_attn_1 - lambda_attn_2 + self.lambda_attn_init
 
-        q_attn = self.softmax((q * self.scale) @ agent_tokens_all.transpose(-2, -1))
-        q_attn = q_attn.view(B, num_heads, N, 2, self.agent_num).permute(0, 1, 3, 2, 4)
-        q_attn = q_attn[:, :, 0] - lambda_attn_full * q_attn[:, :, 1]
-        x = q_attn @ agent_v
+        q_pos = F.relu(q_pos)
+        q_pos = focused_function(q_pos)
+        q_neg = F.relu(q_neg)
+        agent_tokens_pos = F.relu(agent_tokens_pos)
+        agent_tokens_pos = focused_function(agent_tokens_pos)
+        z = 1 / (
+            q_pos @ agent_tokens_pos.mean(dim=-2, keepdim=True).transpose(-2, -1) + 1e-6
+        )
+        kv = (agent_tokens_pos.transpose(-2, -1) * (N**-0.5)) @ (agent_v * (N**-0.5))
+        x1 = q_pos @ kv * z
+
+        z = 1 / (
+            q_neg @ agent_tokens_pos.mean(dim=-2, keepdim=True).transpose(-2, -1) + 1e-6
+        )
+        x2 = q_neg @ kv * z
+
+        x = x1 - lambda_attn_full * x2
+
         x = self.subln2(x)
         x = x * (1 - self.lambda_attn_init)
 
