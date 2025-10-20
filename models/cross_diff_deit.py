@@ -396,8 +396,8 @@ class AgentAttention(nn.Module):
         v_hat = self.subln1(v_hat)
         v_hat = v_hat * (1 - self.lambda_init)
 
-        v_hat_pos1, v_hat_pos2 = v_hat.chunk(2, dim=-1)
-        v_hat_neg1, v_hat_neg2 = v_hat.chunk(2, dim=-1)
+        v_hat_pos1, v_hat_pos2 = v_hat_pos.chunk(2, dim=-1)
+        v_hat_neg1, v_hat_neg2 = v_hat_neg.chunk(2, dim=-1)
         q1, q2 = q.chunk(2, dim=-1)
 
         lambda_1 = torch.exp(

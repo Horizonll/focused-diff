@@ -26,7 +26,6 @@ Hacked together by / Copyright 2021 Ross Wightman
 import logging
 import math
 from collections import OrderedDict
-from copy import deepcopy
 from functools import partial
 
 import torch
