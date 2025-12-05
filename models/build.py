@@ -11,14 +11,14 @@ from .agent_cswin import (
     Agent_CSWin_96_36292_base_224,
     Agent_CSWin_96_36292_base_384,
 )
-from .agent_deit_diff import agent_deit_base, agent_deit_small, agent_deit_tiny
+from .hier_diff_deit import agent_deit_base, agent_deit_small, agent_deit_tiny
 from .agent_pvt import (
     agent_pvt_large,
     agent_pvt_medium,
     agent_pvt_small,
     agent_pvt_tiny,
 )
-from .agent_swin_diff import AgentSwinTransformer
+from .agent_swin_diff_elu import AgentSwinTransformer
 
 
 def build_model(config):
